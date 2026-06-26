@@ -1,34 +1,35 @@
 #!/bin/bash
-# One-time cluster bootstrap. Run on the MPI login node (has proxy internet).
-# Clones the repo to /fast and builds the two uv environments. Requires `uv`
-# and `git` on PATH. The repo is PUBLIC, so the clone needs no token.
+# One-time cluster bootstrap. Run from INSIDE the cloned repo on the MPI login
+# node (which has proxy internet). Builds the two uv environments on /fast.
+# Requires `uv` on PATH. Repo path is auto-detected, so it works wherever you
+# cloned it (e.g. /fast/jtaraz/LIARS/misalignment-indicators-moremodels).
+#
+#   bash scripts/cluster/setup_cluster.sh
 set -euo pipefail
 
-FAST=/fast/jtaraz
-REPO="$FAST/misalignment-indicators"
-export HF_HOME="$FAST/huggingface"
-export TMPDIR="$HOME/tmp"
-mkdir -p "$FAST/envs" "$HF_HOME" "$TMPDIR"
-
-# 1. Clone (public -> no PAT needed)
-if [ ! -d "$REPO/.git" ]; then
-  git clone https://github.com/jotaraz/misalignment-indicators-moremodels.git "$REPO"
-fi
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+ENVS_BASE="${ENVS_BASE:-/fast/jtaraz/envs}"
+export HF_HOME="${HF_HOME:-/fast/jtaraz/huggingface}"
+export TMPDIR="${TMPDIR:-$HOME/tmp}"
+mkdir -p "$ENVS_BASE" "$HF_HOME" "$TMPDIR" "$REPO/logs"
 cd "$REPO"
-mkdir -p logs
 
-# 2. Probe env (GPU): transformers>=5 (GLM is glm4_moe_lite), torch CUDA build.
-#    If the default torch wheel mismatches the driver, reinstall with the right
-#    CUDA index-url, e.g. torch==2.9.0 --index-url .../whl/cu124
-uv venv "$FAST/envs/probe" --python 3.12
-uv pip install --python "$FAST/envs/probe" -r requirements-probe.txt
+echo "Repo:      $REPO"
+echo "Envs base: $ENVS_BASE"
+echo "HF_HOME:   $HF_HOME"
 
-# 3. Bloom env (API/CPU): rollouts + judges, no torch
-uv venv "$FAST/envs/bloom" --python 3.12
-uv pip install --python "$FAST/envs/bloom" -r requirements-bloom.txt
-uv pip install --python "$FAST/envs/bloom" -e ./bloom
+# Probe env (GPU): transformers>=5 (GLM is glm4_moe_lite), torch CUDA build.
+# If the default torch wheel mismatches the driver, reinstall with the right
+# CUDA index-url, e.g. torch==2.9.0 --index-url .../whl/cu124
+uv venv "$ENVS_BASE/probe" --python 3.12
+uv pip install --python "$ENVS_BASE/probe" -r requirements-probe.txt
+
+# Bloom env (API/CPU): rollouts + judges, no torch
+uv venv "$ENVS_BASE/bloom" --python 3.12
+uv pip install --python "$ENVS_BASE/bloom" -r requirements-bloom.txt
+uv pip install --python "$ENVS_BASE/bloom" -e ./bloom
 
 echo
 echo "Bootstrap complete."
-echo "Next: place your .env at $REPO/bloom/.env (OpenRouter + Anthropic + HF),"
-echo "then: cd $REPO && bash scripts/cluster/submit_all_train.sh"
+echo "  .env expected at: $REPO/bloom/.env"
+echo "  start training:   cd $REPO && bash scripts/cluster/submit_all_train.sh"

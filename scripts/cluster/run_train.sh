@@ -11,11 +11,13 @@ MODEL="$1"; shift
 LAYERS="$*"                          # e.g. "48 50"
 SLUG="${MODEL//[^a-zA-Z0-9]/_}"      # llama-70b-r1 -> llama_70b_r1
 
-REPO=/fast/jtaraz/misalignment-indicators
+# Derive repo root from this script's location (scripts/cluster/run_train.sh),
+# so it works regardless of where the repo is cloned on /fast.
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO"
 
 # --- caches & file locking on /fast (see MPI cluster guide) ---
-export HF_HOME=/fast/jtaraz/huggingface
+export HF_HOME="${HF_HOME:-/fast/jtaraz/huggingface}"
 export SOFTFILELOCK=1                 # consumed by scripts/cluster/sitecustomize.py
 export TMPDIR="$HOME/tmp"; mkdir -p "$TMPDIR"
 export PYTORCH_ALLOC_CONF="expandable_segments:True"
@@ -29,7 +31,7 @@ set -a; [ -f bloom/.env ] && source bloom/.env; set +a
 source /etc/profile.d/modules.sh
 module load cuda/12.9
 
-PY=/fast/jtaraz/envs/probe/bin/python
+PY="${ENVS_BASE:-/fast/jtaraz/envs}/probe/bin/python"
 
 echo "[$(date)] train: model=$MODEL layers=$LAYERS -> probe/probes_${SLUG}/"
 "$PY" -m probe.train \

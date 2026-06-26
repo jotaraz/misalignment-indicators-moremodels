@@ -4,7 +4,7 @@
 # and after placing bloom/.env. Override the bid with BID=150 ./submit_all_train.sh
 set -euo pipefail
 
-REPO=/fast/jtaraz/misalignment-indicators
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BID="${BID:-100}"
 RUN="$REPO/scripts/cluster/run_train.sh"
 SUB="$REPO/scripts/cluster/train.sub"
