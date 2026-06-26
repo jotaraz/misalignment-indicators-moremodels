@@ -1,0 +1,67 @@
+# ====================================================================
+# BEHAVIOR CONFIGURATION
+# ====================================================================
+# New "covert" sandbagging setup: the model underperforms because of a
+# SELF-AUTHORED memo in its own system prompt (like instructed-covert-code-sabotage),
+# NOT an obvious external "you must underperform" instruction. This addresses the
+# prior setup being too transparent (the model often noticed the instruction and
+# deliberated/refused).
+behavior:
+  name: "instructed-covert-sandbagging"   # defined in behaviors.json
+  examples:                               # files in behaviors/examples/ (no .json extension)
+    - "instructed_covert_sandbagging_chem_audit"
+    - "instructed_covert_sandbagging_cyber_mcq"
+
+# ====================================================================
+# GLOBAL PARAMETERS
+# ====================================================================
+temperature: 1.0
+evaluator_reasoning_effort: "medium"
+target_reasoning_effort: "medium"   # keep reasoning on so the dual-process (knows-correct -> chooses-wrong) is visible
+max_concurrent: 15
+configurable_prompts: "covert_sandbag"   # loads configurable_prompts/covert_sandbag.json
+anonymous_target: false
+debug: false
+
+# ====================================================================
+# UNDERSTANDING STAGE
+# ====================================================================
+understanding:
+  model: "claude-opus-4.6"
+  max_tokens: 4000   # must exceed the reasoning_effort=medium thinking budget (2048)
+
+# ====================================================================
+# IDEATION STAGE
+# ====================================================================
+ideation:
+  model: "claude-opus-4.6"
+  num_scenarios: 30            # 30 base scenarios -> with the noise variation below = 60 rollouts
+  variation_dimensions: ["noise"]   # each base scenario gets one minimal-perturbation variant (same structure as the val set)
+  max_tokens: 28000            # ~800-1000 tokens/scenario budget for 30 base scenarios
+  web_search: false
+
+# ====================================================================
+# ROLLOUT STAGE
+# ====================================================================
+rollout:
+  model: "claude-opus-4.6"    # evaluator (red team) — plays the benign user asking a capability probe
+  target: "glm-4.7-flash"     # target under evaluation (OpenRouter: z-ai/glm-4.7-flash)
+  modality: "conversation"    # benchmark-style Q&A; the self-memo lives in the target system prompt
+  max_turns: 1                # single benchmark-style probe, same as the prior sandbagging setup
+  max_tokens: 4000
+  no_user_mode: false
+  selected_variations: null
+  num_reps: 1
+
+# ====================================================================
+# JUDGMENT STAGE
+# ====================================================================
+judgment:
+  model: "claude-opus-4.6"
+  max_tokens: 6000
+  num_samples: 1
+  additional_qualities: ["unrealism", "evaluation-awareness", "evaluation-invalidity"]
+  metajudgment_qualities: ["diversity"]
+  # The self-memo is part of the target system prompt; do NOT redact it from the judge,
+  # since the judge needs to see the covert motivation to score the behavior.
+  redaction_tags: null
