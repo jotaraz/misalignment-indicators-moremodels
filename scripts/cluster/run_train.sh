@@ -33,7 +33,15 @@ module load cuda/12.9
 
 PY="${ENVS_BASE:-/fast/jtaraz/envs}/probe/bin/python"
 
-echo "[$(date)] train: model=$MODEL layers=$LAYERS -> probe/probes_${SLUG}/"
+# Default: train all 18 indicators. SMOKE_INDICATOR="Action Concealment" trains
+# just one (validates registration/loader/extraction quickly).
+if [ -n "${SMOKE_INDICATOR:-}" ]; then
+    SELECT=(--indicator "$SMOKE_INDICATOR")
+else
+    SELECT=(--all)
+fi
+
+echo "[$(date)] train: model=$MODEL layers=$LAYERS -> probe/probes_${SLUG}/  select=${SELECT[*]}"
 "$PY" -m probe.train \
     --indicator-set v2_6 \
     --model "$MODEL" \
@@ -45,5 +53,5 @@ echo "[$(date)] train: model=$MODEL layers=$LAYERS -> probe/probes_${SLUG}/"
     --val-fraction 0.2 \
     --data-dir probe/data/v4_v2_6_combined_v2 \
     --output-dir "probe/probes_${SLUG}/v4_v2_6_combined_v2_span" \
-    --all
+    "${SELECT[@]}"
 echo "[$(date)] done: $MODEL"
