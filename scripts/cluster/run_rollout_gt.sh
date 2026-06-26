@@ -27,8 +27,13 @@ export PYTHONPATH="$REPO:${PYTHONPATH:-}"  # so `black_box_ind_judge` imports
 # sanitize model -> dir slug (mirror bloom.utils.sanitize_model_name)
 SLUG="$(echo "$MODEL" | tr './-' '___' | sed 's/__*/_/g')"
 
-echo "[$(date)] rollouts: $MODEL  ${REASON_FLAG}"
-"$PY" cross_model_rollout.py --target "$MODEL" $REASON_FLAG
+# Cross-model targets are evaluated only on the TOOL-FREE conversation behaviors:
+# tool-using behaviors (self-preservation/sabotage = simenv, strategic-deception =
+# function-calling) fail for these OpenRouter models — the simenv gate plus a deeper
+# tool-execution hang/crash. See the cross-model-agentic-scope decision.
+CONV_BEHAVIORS="sycophancy instructed-strategic-sandbagging"
+echo "[$(date)] rollouts: $MODEL  ${REASON_FLAG}  behaviors=[$CONV_BEHAVIORS]"
+"$PY" cross_model_rollout.py --target "$MODEL" $REASON_FLAG --behaviors $CONV_BEHAVIORS
 
 echo "[$(date)] ground truth: $MODEL (slug=$SLUG)"
 PYBIN="$PY" bash "$REPO/bloom/cross_model_gt.sh" "$SLUG"
