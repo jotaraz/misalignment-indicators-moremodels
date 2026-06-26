@@ -20,7 +20,8 @@ export TMPDIR="${TMPDIR:-$HOME/tmp}"; mkdir -p "$TMPDIR"
 set -a; [ -f "$REPO/bloom/.env" ] && source "$REPO/bloom/.env"; set +a
 
 PY="${ENVS_BASE:-/fast/jtaraz/envs}/bloom/bin/python"
-export PATH="$(dirname "$PY"):$PATH"      # so the `bloom` console script resolves
+# bloom env bin first (for `bloom`); also ensure coreutils on condor's minimal PATH
+export PATH="$(dirname "$PY"):/usr/local/bin:/usr/bin:/bin:$PATH"
 export PYTHONPATH="$REPO:${PYTHONPATH:-}"  # so `black_box_ind_judge` imports
 
 # sanitize model -> dir slug (mirror bloom.utils.sanitize_model_name)

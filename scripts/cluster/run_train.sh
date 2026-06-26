@@ -8,6 +8,7 @@
 set -euo pipefail
 
 : "${HOME:=/home/jtaraz}"; export HOME   # condor's clean env may not set HOME (set -u)
+export PATH="/usr/local/bin:/usr/bin:/bin:${PATH:-}"   # condor's clean env has a minimal PATH
 
 MODEL="$1"; shift
 LAYERS="$*"                          # e.g. "48 50"
