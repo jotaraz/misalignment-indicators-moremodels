@@ -42,11 +42,31 @@ per-turn scorer needed). This is the big simplification vs the original Qwen §8
 ## Done
 
 - **A** Model registration — `…/deception_detection/models.py` (6 models; loaders fixed for cluster download; R1 uses its own tokenizer).
-- **B** Training — validated end-to-end (gemma-27b probe, 0.98 val AUROC). `scripts/cluster/{run_train.sh,train.sub,submit_all_train.sh}`.
-- **C** Rollout + GT — validated (R1 sycophancy). `bloom/cross_model_rollout.py` (+ `--limit`, `--split` TBD), `bloom/cross_model_gt.sh`, `scripts/cluster/{run_rollout_gt.sh,rollout_gt.sub,submit_all_rollout_gt.sh}`. Restricted to the 2 conv behaviors.
+- **B** Training — pipeline validated (gemma-27b smoke probe, 0.98 val AUROC). `scripts/cluster/{run_train.sh,train.sub,submit_all_train.sh}`. **But the full fan-out exposed per-model template/OOM issues — see next section.**
+- **C** Rollout + GT — validated; **dev rollouts succeeded for all 4 models** (sycophancy + sandbagging, misaligned+benign). `bloom/cross_model_rollout.py` (+ `--limit`, `--split` TBD), `bloom/cross_model_gt.sh`, `scripts/cluster/{run_rollout_gt.sh,rollout_gt.sub,submit_all_rollout_gt.sh}`. Restricted to the 2 conv behaviors.
 - **E foundation** — `bloom/cross_model_registry.py`; dev scoring `scripts/cluster/{run_score.sh,submit_all_score.sh}` (uses `evaluate.py`).
 
-Full fan-out (training + dev rollouts/GT for all 4) was launched 2026-06-26; let it finish before scoring.
+## Training fan-out outcome — per-model template status (2026-06-26)
+
+The pipeline is built around GLM/Qwen/Llama-3/Gemma chat templates (`tokenized_data.py`
+hardcodes a detect-mask regex per `ModelType`). Older-style templates work; the two newest
+models fight it. The first full fan-out (`submit_all_train.sh`) result:
+
+| Model | Training status | Detail |
+|---|---|---|
+| **gemma-27b** | ✅ works (needs 2 GPUs) | CUDA OOM on 1×H100; fixed by `request_gpus = 2`. Re-run `submit_all_train.sh` style with 2 GPUs for gemma. |
+| **llama-3.3-70b** | ✅ works | standard Llama-3 template; trains clean. |
+| **mistral-24b** | ⚠️ partial fix | Regex extended for Mistral-Small-3 `[SYSTEM_PROMPT]` + `fix_mistral_regex=True` (committed). REMAINING BUG: `TokenizedDataset.from_dialogue_list` formats mistral with a **default system prompt** ("You are Mistral Small 3…") instead of the dialogue's system message → the content-verbatim assertion (`tokenized_data.py:224`) fails. `apply_chat_template` alone preserves the real system content, so the divergence is inside `from_dialogue_list`'s mistral formatting/template_kwargs path — trace there. |
+| **llama-70b-r1** | ❌ UNFIXABLE for probe training | DeepSeek-R1 template (a) uses `<｜User｜>`/`<｜Assistant｜>` tokens (wrong regex branch — it's `type=="llama"`), and (b) **strips `<think>` reasoning from assistant history** (`.split('</think>')[-1]` baked into the template). So the synthetic reasoning spans vanish and the model never ingests reasoning → a reasoning probe cannot be trained. No flag disables the stripping. **Recommend dropping R1 entirely** (it also failed agentic). |
+
+**Open decisions (pending):** (1) drop R1 from the whole cross-model set? (recommended);
+(2) invest one more debugging pass on the mistral default-system-prompt quirk, or settle for
+**gemma + llama-3.3** as the trained set. Either way the trained cross-model probes are
+**non-reasoning only** (GLM/Qwen remain the reasoning models).
+
+To resume training after fixes: `bash scripts/cluster/submit_all_train.sh` (give gemma 2 GPUs;
+drop R1 from the submit list; include mistral only once the from_dialogue_list fix lands).
+`train.py` skips already-trained indicators, so re-runs resume.
 
 ## Remaining Part E (build + VALIDATE against landed data — don't build blind)
 
@@ -91,6 +111,16 @@ The smoke test caught 9 bugs precisely by validating against live data. Do the s
 ---
 
 ## Hard-won gotchas (don't re-discover these)
+
+- **`tokenized_data.py` hardcodes a detect-mask regex per chat template** (`_prefix_pattern`,
+  `ModelType`). New templates break it: Mistral-Small-3 added `[SYSTEM_PROMPT]` (regex fixed);
+  DeepSeek-R1 uses `<｜User｜>` tokens AND strips `<think>` from history (unfixable). The
+  `_get_detection_mask` algorithm also requires each message's content to appear **verbatim**
+  in the formatted text (`:224`) — any template that rewrites/strips/injects content breaks it
+  (e.g. R1 reasoning-strip; mistral default-system-prompt). When adding a model, render its
+  template first (`tok.apply_chat_template`) and check both the prefix tokens and verbatim content.
+- **R1-distill can't train reasoning probes** — its template removes `<think>` from assistant
+  history, so the model never sees the reasoning the probe must read. Not a code bug.
 
 - **`probe/data/` and `probe_eval/results/` are gitignored.** The upstream repo force-added the
   training data; the fresh-init `git add -A` dropped it. Training data + neutral set live ONLY on
