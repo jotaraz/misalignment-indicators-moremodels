@@ -148,7 +148,15 @@ def run_pipeline(config: Dict[str, Any], config_dir: Optional[Path] = None) -> D
 
         # Whitelist of models that support function calling but LiteLLM might not recognize
         # (e.g., OpenRouter models that LiteLLM doesn't have in its registry)
-        FUNCTION_CALLING_WHITELIST = ["deepseek-v3", "kimi-k2", "kimi-k2-thinking", "qwen3-32b"]
+        FUNCTION_CALLING_WHITELIST = [
+            "deepseek-v3", "kimi-k2", "kimi-k2-thinking", "qwen3-32b",
+            # Cross-model targets: litellm doesn't recognize these OpenRouter ids as
+            # tool-capable, but the instruct models do support function calling.
+            # (gemma-2-27b / R1-distill are weak at agentic tool use — whitelisting
+            # only lets them attempt it; rollout quality is a separate question.)
+            "qwen3.6-35b-a3b", "llama-3.3-70b", "mistral-small-24b",
+            "gemma-2-27b", "deepseek-r1-llama-70b",
+        ]
 
         # Check both evaluator and target models support function calling
         evaluator_model = config["rollout"].get("model")
