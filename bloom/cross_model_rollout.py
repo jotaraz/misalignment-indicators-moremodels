@@ -82,7 +82,7 @@ def make_config_dir(tmp: str, seed: dict) -> Path:
 
 
 def run_one(target: str, behavior: str, spec: dict, benign: bool,
-            reasoning: bool, force: bool) -> None:
+            reasoning: bool, force: bool, limit: int | None = None) -> None:
     name = f"{behavior}_benign" if benign else behavior
     src_dir = RESULTS / (spec["src_benign"] if benign else spec["src"])
     out_dir = RESULTS / f"{name}_{sanitize(target)}"
@@ -100,6 +100,14 @@ def run_one(target: str, behavior: str, spec: dict, benign: bool,
     out_dir.mkdir(parents=True, exist_ok=True)
     for fname in ("understanding.json", "ideation.json"):
         shutil.copy2(src_dir / fname, out_dir / fname)
+
+    # --limit: trim the scenario set for a cheap smoke test (variations drive rollouts).
+    if limit is not None:
+        ide = json.load(open(out_dir / "ideation.json"))
+        if isinstance(ide.get("variations"), list):
+            ide["variations"] = ide["variations"][:limit]
+            json.dump(ide, open(out_dir / "ideation.json", "w"), indent=2)
+            print(f"  (limit) trimmed to {len(ide['variations'])} scenario(s)")
 
     seed = yaml.safe_load(open(DATA / "seed.yaml"))
     seed["behavior"] = {"name": name, "examples": spec["examples"]}
@@ -132,12 +140,14 @@ def main() -> None:
     ap.add_argument("--behaviors", nargs="*", default=list(BEHAVIORS),
                     help="subset of the 5 dev behaviors (default: all)")
     ap.add_argument("--force", action="store_true", help="re-run even if rollout.json exists")
+    ap.add_argument("--limit", type=int, default=None,
+                    help="cap scenarios per dir (smoke test); default: all")
     args = ap.parse_args()
 
     for b in args.behaviors:
         spec = BEHAVIORS[b]
         for benign in (False, True):
-            run_one(args.target, b, spec, benign, args.reasoning, args.force)
+            run_one(args.target, b, spec, benign, args.reasoning, args.force, args.limit)
 
 
 if __name__ == "__main__":
