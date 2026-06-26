@@ -116,13 +116,19 @@ def run_one(target: str, behavior: str, spec: dict, benign: bool,
     seed["evaluator_reasoning_effort"] = "none"
     seed["target_reasoning_effort"] = "high" if reasoning else "none"
     seed["rollout"] = {
-        "model": meta.get("evaluator", "claude-opus-4.6"),
+        # Fixed, known-good evaluator. The GLM metadata sometimes names an
+        # evaluator version that isn't in models.json (e.g. claude-opus-4.5),
+        # which fails model resolution; claude-opus-4.6 is the section-8 standard.
+        "model": "claude-opus-4.6",
         "target": target,
         "modality": meta.get("modality", "conversation"),
         "max_turns": int(meta.get("max_turns", 1)),
         "no_user_mode": str(meta.get("no_user_mode", "False")).lower() == "true",
         "num_reps": int(src_top.get("repetitions_per_variation", 1)),
         "selected_variations": None,
+        # Must exceed the target's thinking budget (reasoning_effort high -> 4096).
+        # Generous cap = room for CoT + answer; harmless cap for non-reasoning targets.
+        "max_tokens": 16000,
     }
 
     with tempfile.TemporaryDirectory(dir=BLOOM_DIR) as tmp:
