@@ -143,12 +143,18 @@ class TokenizedDataset:
                 rf"{begin_of_text}{start_of_turn}|{end_of_last}{start_of_turn}|(\n\n)?"
             )
         elif tokenizer_type == "mistral":
-            message_end = r"(</s>)?"
-            message_start = r"((<pad>)*<s>)?"
-            inst_start = r" \[INST\] "
-            inst_end = r" \[/INST\] "
+            # Mistral-Small-3 (2501) template:
+            #   <s>[SYSTEM_PROMPT]{sys}[/SYSTEM_PROMPT][INST]{user}[/INST]{asst}</s>[INST]...
+            # (older Mistral-7B v0.x used " [INST] "/" [/INST] " with spaces; the
+            # optional " ?" keeps both working.) Content is preserved verbatim.
+            bos = r"(<pad>)*<s>"
             return re.compile(
-                rf"{message_end}{message_start}{inst_start}|{inst_end}|(\n\n)|{message_end}"
+                rf"{bos}\[SYSTEM_PROMPT\]"          # dialogue start, with system prompt
+                rf"|{bos} ?\[INST\] ?"             # dialogue start, no system prompt
+                rf"|\[/SYSTEM_PROMPT\]\[INST\]"     # system -> user
+                rf"|(</s>)? ?\[INST\] ?"           # assistant -> next user
+                rf"| ?\[/INST\] ?"                 # user -> assistant
+                rf"|(</s>)?"                        # trailing </s> / empty fallback
             )
         if tokenizer_type == "llama":
             begin_of_text = r"((<\|pad\|>)*(<\|begin_of_text\|>))?"

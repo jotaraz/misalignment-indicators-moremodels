@@ -205,7 +205,14 @@ def get_mistral_model_and_tokenizer(
     }[model_name]
 
     dtype = torch.bfloat16
-    tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="left")
+    # Mistral-Small-3 ships a tokenizer whose split regex transformers flags as
+    # incorrect unless fix_mistral_regex=True (harmless/ignored for older mistral).
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path, padding_side="left", fix_mistral_regex=True
+        )
+    except TypeError:
+        tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="left")
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.bos_token_id
 
