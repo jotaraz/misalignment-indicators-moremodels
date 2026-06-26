@@ -7,6 +7,8 @@
 #   e.g. run_train.sh llama-70b-r1 48 50
 set -euo pipefail
 
+: "${HOME:=/home/jtaraz}"; export HOME   # condor's clean env may not set HOME (set -u)
+
 MODEL="$1"; shift
 LAYERS="$*"                          # e.g. "48 50"
 SLUG="${MODEL//[^a-zA-Z0-9]/_}"      # llama-70b-r1 -> llama_70b_r1

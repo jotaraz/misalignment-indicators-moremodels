@@ -7,6 +7,8 @@
 #   e.g. run_rollout_gt.sh deepseek-r1-llama-70b --reasoning
 set -euo pipefail
 
+: "${HOME:=/home/jtaraz}"; export HOME    # condor's clean env may not set HOME (set -u)
+
 MODEL="$1"; shift || true
 REASON_FLAG="${1:-}"                      # "" or "--reasoning"
 
