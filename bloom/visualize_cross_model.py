@@ -128,8 +128,8 @@ def render_turn(role, content, view, *, is_target, target_idx, gt_for_turn, mode
         cls, label = "sys", "SYSTEM PROMPT"
     elif role == "tool":
         cls, label = "tool", "TOOL RESULT"
-    else:  # assistant but not target = evaluator scaffolding
-        cls, label = "sys", "EVALUATOR (scenario setup)"
+    else:
+        cls, label = "sys", str(role).upper()
 
     html_parts = []
     for kind, text in parts:
@@ -234,9 +234,15 @@ def render_dir(d: Path) -> str:
             m = e.get("edit", {}).get("message") if isinstance(e.get("edit"), dict) else None
             if not isinstance(m, dict):
                 continue
-            role = m.get("role")
             view = e.get("view", [])
-            is_target = role == "assistant" and "target" in view
+            # Render only the target-view conversation: every message is stored twice
+            # (once per participant's view); the target view is exactly what the probed
+            # model saw — its system prompt, the evaluator's messages as `user`, and its
+            # own responses as `assistant`. This dedups and drops setup scaffolding.
+            if "target" not in view:
+                continue
+            role = m.get("role")
+            is_target = role == "assistant"
             ti = None
             gt_for_turn = None
             if is_target:
