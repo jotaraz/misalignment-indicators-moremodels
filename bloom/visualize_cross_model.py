@@ -146,20 +146,41 @@ def render_turn(role, content, view, *, is_target, target_idx, gt_for_turn, mode
     return f'<div class="turn {cls}">{inner}</div>'
 
 
-def build_gt_index(gt, var, rep):
-    """Return {target_turn_index: {misaligned, description, indicators}} for one rollout."""
+def _find_turn(norm_targets, probes, turn_index_fallback):
+    """Locate the 0-based target turn for a GT entry by matching its quoted text.
+
+    GT turn_index counting differs by modality (1-based for conversation, 0-based-ish
+    for agentic/simenv), so we anchor on the verbatim evidence/spans instead and only
+    fall back to turn_index when no quote matches.
+    """
+    for p in probes:
+        if not p or len(p) < 8:
+            continue
+        np = re.sub(r"\s+", " ", p).lower()[:80]
+        for i, t in enumerate(norm_targets):
+            if np in t:
+                return i
+    return turn_index_fallback
+
+
+def build_gt_index(gt, var, rep, target_texts):
+    """Return {target_turn_index: {misaligned, description, indicators}} for one rollout.
+
+    target_texts: per-target-turn concatenated text (for content-based turn matching).
+    """
     if not gt:
         return {}, None
+    norm = [re.sub(r"\s+", " ", t).lower() for t in target_texts]
     for er in gt.get("evaluated_rollouts", []):
         if er.get("variation_number") == var and er.get("repetition_number") == rep:
             idx = {}
-            # GT turn_index is 1-based over target turns; our target_i is 0-based.
             for mt in er.get("misaligned_turns", []):
-                ti = mt.get("turn_index", 0) - 1
+                ti = _find_turn(norm, mt.get("evidence", []), mt.get("turn_index", 1) - 1)
                 idx.setdefault(ti, {})["misaligned"] = True
                 idx[ti]["description"] = mt.get("description", "")
             for it in er.get("indicators_turns", []):
-                ti = it.get("turn_index", 0) - 1
+                spans = [s for ind in it.get("present_indicators", []) for s in ind.get("spans", [])]
+                ti = _find_turn(norm, spans, it.get("turn_index", 1) - 1)
                 idx.setdefault(ti, {})["indicators"] = it.get("present_indicators", [])
             return idx, er.get("summary", "")
     return {}, None
@@ -176,8 +197,14 @@ def render_dir(d: Path) -> str:
     blocks = []
     for r in rollout.get("rollouts", []):
         var, rep = r.get("variation_number"), r.get("repetition_number")
-        gt_idx, summary = build_gt_index(gt, var, rep)
         events = r["transcript"]["events"]
+        # pass 1: per-target-turn text, used to anchor GT labels by quoted content
+        target_texts = []
+        for e in events:
+            m = e.get("edit", {}).get("message") if isinstance(e.get("edit"), dict) else None
+            if isinstance(m, dict) and m.get("role") == "assistant" and "target" in e.get("view", []):
+                target_texts.append(" ".join(t for _, t in _content_parts(m.get("content"))))
+        gt_idx, summary = build_gt_index(gt, var, rep, target_texts)
         turns_html = []
         target_i = -1
         n_bad = 0
