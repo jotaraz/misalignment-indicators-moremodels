@@ -37,12 +37,18 @@ header b{color:#7dd3fc}
 .turn{margin:8px 0;border-radius:6px;border-left:4px solid #cbd5e1;overflow:hidden}
 .turn>summary{cursor:pointer;list-style:none;display:flex;align-items:baseline;gap:8px;padding:6px 12px}
 .turn>summary::-webkit-details-marker{display:none}
-.turn .tog::before{content:"\\25BE";color:#94a3b8;font-size:11px}
-.turn:not([open]) .tog::before{content:"\\25B8"}
+.tog::before{content:"\\25BE";color:#94a3b8;font-size:11px}
+details:not([open])>summary .tog::before{content:"\\25B8"}
 .turn .hl{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:#64748b;font-weight:700;white-space:nowrap}
-.turn .preview{color:#475569;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
-.turn[open] .preview{display:none}
+.preview{color:#475569;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+details[open]>summary .preview{display:none}
 .tbody{padding:0 12px 9px}
+/* per-CoT collapsible reasoning block */
+.cot{margin:4px 0}
+.cot>summary{cursor:pointer;list-style:none;display:flex;align-items:baseline;gap:6px}
+.cot>summary::-webkit-details-marker{display:none}
+.cot-lbl{font-style:italic;font-weight:600;color:#6b7280;font-size:12px;white-space:nowrap}
+.cot .reasoning{margin-top:4px}
 .sys{background:#f1f5f9;border-color:#94a3b8}
 .user{background:#eff6ff;border-color:#3b82f6}
 .tool{background:#fefce8;border-color:#ca8a04}
@@ -130,7 +136,12 @@ def render_turn(role, content, view, *, is_target, target_idx, gt_for_turn, mode
         esc = html.escape(text)
         esc = _highlight(esc, spans if kind in ("text", "reasoning") else [])
         if kind == "reasoning":
-            html_parts.append(f'<div class="reasoning">💭 {esc}</div>')
+            rprev = html.escape(next((ln.strip() for ln in text.splitlines() if ln.strip()), "")[:120])
+            html_parts.append(
+                f'<details class="cot" open><summary><span class="tog"></span>'
+                f'<span class="cot-lbl">💭 reasoning</span>'
+                f'<span class="preview">{rprev}</span></summary>'
+                f'<div class="reasoning">{esc}</div></details>')
         else:
             html_parts.append(f'<div class="resp">{esc}</div>')
 
@@ -253,6 +264,8 @@ def render_dir(d: Path) -> str:
 <header><b>{html.escape(d.name)}</b> &nbsp; model={html.escape(model)} &nbsp; rollouts={n_rollouts}
 &nbsp; <button class="btn" onclick="document.querySelectorAll('details.turn').forEach(d=>d.open=true)">▾ expand all turns</button>
 <button class="btn" onclick="document.querySelectorAll('details.turn').forEach(d=>d.open=false)">▸ collapse all turns</button>
+<button class="btn" onclick="document.querySelectorAll('details.cot').forEach(d=>d.open=true)">💭 expand all CoT</button>
+<button class="btn" onclick="document.querySelectorAll('details.cot').forEach(d=>d.open=false)">💭 collapse all CoT</button>
 <div class="legend"><span>🟩 target</span><span>🟦 evaluator/user</span><span>⬜ system/setup</span>
 <span>🟥 GT-misaligned turn</span><span><mark>indicator span</mark></span><span>💭 reasoning</span>
 <span>(click any turn header to minimize it)</span></div>
