@@ -534,6 +534,10 @@ async def evaluate_rollout_file_indicator_turns(
             existing_rollouts[idx]["indicators_turns"] = indicators_turns
             if "indicator_judge_errors" in result:
                 existing_rollouts[idx]["indicator_judge_errors"] = result["indicator_judge_errors"]
+            else:
+                # Clean re-judge: drop any stale error from a prior failed run,
+                # otherwise an old (e.g. credit-balance) error masks a now-good result.
+                existing_rollouts[idx].pop("indicator_judge_errors", None)
         else:
             new_entry = {
                 "variation_number": vn,
