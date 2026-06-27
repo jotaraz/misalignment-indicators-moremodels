@@ -6,7 +6,13 @@
 #   e.g. <target_slug> = llama_3_3_70b  (sanitized model name)
 set -euo pipefail
 
-SLUG="$1"
+SLUG="$1"; shift || true
+# Optional behavior filter: extra args restrict to those behaviors (default: all 5).
+BEHAVIORS=("$@")
+if [ ${#BEHAVIORS[@]} -eq 0 ]; then
+  BEHAVIORS=(self-preservation strategic-deception sycophancy \
+             instructed-covert-code-sabotage instructed-strategic-sandbagging)
+fi
 PY="${PYBIN:-python}"
 JUDGE_MODEL="claude-opus-4-6"
 THINK=20000
@@ -20,8 +26,7 @@ declare -A TB=(
   [instructed-strategic-sandbagging]=sandbagging
 )
 
-for beh in self-preservation strategic-deception sycophancy \
-           instructed-covert-code-sabotage instructed-strategic-sandbagging; do
+for beh in "${BEHAVIORS[@]}"; do
   md="bloom-results/${beh}_${SLUG}"
   bd="bloom-results/${beh}_benign_${SLUG}"
   label="${TB[$beh]}"
