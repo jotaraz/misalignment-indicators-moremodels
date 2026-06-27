@@ -32,14 +32,25 @@ header b{color:#7dd3fc}
 .rollout>summary::-webkit-details-marker{display:none}
 .rsum{font-weight:400;color:#475569;font-size:13px;margin:2px 0 0}
 .body{padding:10px 14px}
-.turn{margin:10px 0;padding:8px 12px;border-radius:6px;border-left:4px solid #cbd5e1}
+.btn{background:#334155;color:#fff;border:0;border-radius:5px;font-size:12px;padding:3px 9px;margin-right:6px;cursor:pointer}
+/* per-turn collapsible cell */
+.turn{margin:8px 0;border-radius:6px;border-left:4px solid #cbd5e1;overflow:hidden}
+.turn>summary{cursor:pointer;list-style:none;display:flex;align-items:baseline;gap:8px;padding:6px 12px}
+.turn>summary::-webkit-details-marker{display:none}
+.turn .tog::before{content:"\\25BE";color:#94a3b8;font-size:11px}
+.turn:not([open]) .tog::before{content:"\\25B8"}
+.turn .hl{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:#64748b;font-weight:700;white-space:nowrap}
+.turn .preview{color:#475569;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+.turn[open] .preview{display:none}
+.tbody{padding:0 12px 9px}
 .sys{background:#f1f5f9;border-color:#94a3b8}
 .user{background:#eff6ff;border-color:#3b82f6}
-.tool{background:#fefce8;border-color:#ca8a04;font-family:ui-monospace,monospace;font-size:12px;white-space:pre-wrap}
+.tool{background:#fefce8;border-color:#ca8a04}
+.tool .resp,.tool .tbody{font-family:ui-monospace,monospace;font-size:12px}
 .target{background:#f0fdf4;border-color:#22c55e}
+.target>summary .hl{color:#15803d}
 .target.bad{background:#fef2f2;border-color:#ef4444}
-.role{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:#64748b;font-weight:700;margin-bottom:4px}
-.target .role{color:#15803d}.target.bad .role{color:#b91c1c}
+.target.bad>summary .hl{color:#b91c1c}
 .reasoning{color:#6b7280;font-style:italic;background:#fafafa;border:1px dashed #d1d5db;border-radius:5px;padding:6px 8px;margin:4px 0;white-space:pre-wrap}
 .resp{white-space:pre-wrap}
 .badge{display:inline-block;background:#ef4444;color:#fff;font-size:11px;font-weight:700;padding:1px 7px;border-radius:10px;margin-left:8px}
@@ -47,8 +58,6 @@ header b{color:#7dd3fc}
 .gt .lbl{font-weight:700;color:#9a3412}
 .chip{display:inline-block;background:#fde68a;color:#92400e;font-size:11px;font-weight:600;padding:1px 7px;border-radius:9px;margin:2px 4px 0 0}
 mark{background:#fde047;padding:0 1px;border-radius:2px}
-mark.r{background:#fbcfe8}
-details.collapsed>summary{color:#94a3b8}
 """
 
 
@@ -122,8 +131,6 @@ def render_turn(role, content, view, *, is_target, target_idx, gt_for_turn, mode
         esc = _highlight(esc, spans if kind in ("text", "reasoning") else [])
         if kind == "reasoning":
             html_parts.append(f'<div class="reasoning">💭 {esc}</div>')
-        elif kind == "other":
-            html_parts.append(f'<div class="tool">{esc}</div>')
         else:
             html_parts.append(f'<div class="resp">{esc}</div>')
 
@@ -136,14 +143,18 @@ def render_turn(role, content, view, *, is_target, target_idx, gt_for_turn, mode
         gt_html = (f'<div class="gt"><span class="lbl">GT judge:</span> {desc}'
                    + (f'<div>{chips}</div>' if chips else "") + "</div>")
 
-    # collapse long system / scaffolding blocks
-    collapse = cls in ("sys",) and sum(len(t) for _, t in parts) > 400
-    inner = f'<div class="role">{label}{badge}</div>' + "".join(html_parts) + gt_html
-    if collapse:
-        return (f'<details class="turn {cls} collapsed"><summary class="role">{label}'
-                f' (click to expand, {sum(len(t) for _,t in parts)} chars)</summary>'
-                + "".join(html_parts) + gt_html + "</details>")
-    return f'<div class="turn {cls}">{inner}</div>'
+    # one-line preview shown when the cell is collapsed
+    full_text = "\n".join(t for _, t in parts).strip()
+    first_line = next((ln.strip() for ln in full_text.splitlines() if ln.strip()), "")
+    preview = html.escape(first_line[:160] + ("…" if len(first_line) > 160 else ""))
+
+    # default-collapse only long system/scaffolding cells; everything else open
+    open_attr = "" if (cls.startswith("sys") and len(full_text) > 400) else " open"
+    return (f'<details class="turn {cls}"{open_attr}>'
+            f'<summary><span class="tog"></span>'
+            f'<span class="hl">{label}{badge}</span>'
+            f'<span class="preview">{preview}</span></summary>'
+            f'<div class="tbody">{"".join(html_parts)}{gt_html}</div></details>')
 
 
 def _find_turn(norm_targets, probes, turn_index_fallback):
@@ -240,8 +251,11 @@ def render_dir(d: Path) -> str:
     return f"""<!doctype html><html><head><meta charset="utf-8"><title>{html.escape(d.name)}</title>
 <style>{CSS}</style></head><body>
 <header><b>{html.escape(d.name)}</b> &nbsp; model={html.escape(model)} &nbsp; rollouts={n_rollouts}
+&nbsp; <button class="btn" onclick="document.querySelectorAll('details.turn').forEach(d=>d.open=true)">▾ expand all turns</button>
+<button class="btn" onclick="document.querySelectorAll('details.turn').forEach(d=>d.open=false)">▸ collapse all turns</button>
 <div class="legend"><span>🟩 target</span><span>🟦 evaluator/user</span><span>⬜ system/setup</span>
-<span>🟥 GT-misaligned turn</span><span><mark>indicator span</mark></span><span>💭 reasoning</span></div>
+<span>🟥 GT-misaligned turn</span><span><mark>indicator span</mark></span><span>💭 reasoning</span>
+<span>(click any turn header to minimize it)</span></div>
 </header><div class="wrap">{"".join(blocks)}</div></body></html>"""
 
 
