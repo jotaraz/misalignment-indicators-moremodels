@@ -25,6 +25,8 @@ class RolePlayingDataset(DialogueDataset):
         "llama": {"left": 0, "right": 0},
         "qwen": {"left": 0, "right": 0},
         "glm": {"left": 0, "right": 0},
+        "r1": {"left": 0, "right": 0},
+        "gptoss": {"left": 0, "right": 0},
     }
 
     def _load_yaml(self) -> list[dict[str, str]]:

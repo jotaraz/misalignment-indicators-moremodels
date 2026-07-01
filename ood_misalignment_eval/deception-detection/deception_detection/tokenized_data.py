@@ -70,6 +70,22 @@ def _normalize_qwen_think_content(content: str, is_final: bool) -> str:
     return f"<think>\n\n</think>\n\n{content.strip()}"
 
 
+def _split_gptoss_think(content: str) -> tuple[str, str]:
+    """Split assistant content into (reasoning, visible) for gpt-oss harmony.
+
+    The shared training data stores reasoning inline as ``<think>...</think>{visible}``
+    (GLM/Qwen style). gpt-oss's harmony template instead reads reasoning from a separate
+    ``thinking`` message field and renders it in its native analysis channel, so we split
+    the inline form. Extraction mirrors _normalize_glm_think_content (first <think> block;
+    visible = everything after the last </think>).
+    """
+    if "<think>" not in content or "</think>" not in content:
+        return "", content.strip()
+    reasoning = content.split("</think>")[0].split("<think>")[-1].strip()
+    visible = content.split("</think>")[-1].strip()
+    return reasoning, visible
+
+
 def decode_single_token(token_id: int, tokenizer: PreTrainedTokenizerBase) -> str:
     """Decode a single token."""
     if "llama" in tokenizer.__class__.__name__.lower():
@@ -118,6 +134,11 @@ class TokenizedDataset:
     detection_mask: Bool[Tensor, "n_dialogues seq_pos"] | None
     attention_mask: Int[Tensor, "n_dialogues seq_pos"]
     dataset_partial_id: str | None = None
+    # Per-token (char_start, char_end) offsets into formatted_dialogues, from the fast
+    # tokenizer. Used for span/text matching that must be robust to tokenizers whose
+    # per-token decode does not round-trip (e.g. DeepSeek-R1 drops spaces). None if the
+    # tokenizer is not fast (no offset mapping available).
+    offsets: list[list[tuple[int, int]]] | None = None
 
     @staticmethod
     def _final_message_is_assistant(dialogue: Dialogue) -> bool:
@@ -194,6 +215,22 @@ class TokenizedDataset:
             return re.compile(
                 rf"{begin_of_text}{start_of_turn}|{end_of_turn}{start_of_turn}|(\n\n)?"
             )
+        elif tokenizer_type == "r1":
+            # DeepSeek-R1-Distill template renders:
+            #   {bos}{system}<｜User｜>{user}<｜Assistant｜>{asst}<｜end▁of▁sentence｜>...
+            # The system prompt is folded right after bos with NO role token, so the
+            # first turn's prefix is either {bos}<｜User｜> (no system) or {bos} alone
+            # (system message). With our custom non-stripping template the assistant
+            # content (incl. <think>...</think>) renders verbatim, so no normalization
+            # is needed and message.content matches char-for-char.
+            bos = r"(<｜begin▁of▁sentence｜>)"
+            eos = r"(<｜end▁of▁sentence｜>)"
+            user = r"<｜User｜>"
+            asst = r"<｜Assistant｜>"
+            # matches: bos+user (start, no system) | bos (start, system message)
+            #        | (eos)?+user (system/assistant -> user) | asst (user -> assistant)
+            #        | '\n\n' / empty fallback
+            return re.compile(rf"{bos}{user}|{bos}|{eos}?{user}|{asst}|(\n\n)?")
         else:
             raise ValueError(f"Unknown tokenizer type: {tokenizer_type}")
 
@@ -256,6 +293,77 @@ class TokenizedDataset:
 
         return detection_mask
 
+    @staticmethod
+    def _gptoss_harmony_dicts(dialogue: Dialogue) -> list[dict[str, str]]:
+        """Convert a dialogue to harmony message dicts, splitting assistant content
+        into the separate ``thinking`` (analysis channel) and ``content`` (final
+        channel) fields gpt-oss's template expects. Roles in our turn samples already
+        alternate, so no same-role concatenation is needed."""
+        out: list[dict[str, str]] = []
+        for m in dialogue:
+            if m.role == "assistant":
+                reasoning, visible = _split_gptoss_think(m.content)
+                msg: dict[str, str] = {"role": "assistant", "content": visible}
+                if reasoning:
+                    msg["thinking"] = reasoning
+                out.append(msg)
+            else:
+                out.append({"role": m.role, "content": m.content})
+        return out
+
+    # Analysis (reasoning) and final (visible) channel spans of a harmony assistant turn.
+    _GPTOSS_ANALYSIS_RE = re.compile(r"<\|channel\|>analysis<\|message\|>(.*?)<\|end\|>", re.S)
+    _GPTOSS_FINAL_RE = re.compile(
+        r"<\|channel\|>final<\|message\|>(.*?)(?:<\|end\|>|<\|return\|>)", re.S
+    )
+
+    @staticmethod
+    def _get_gptoss_detection_mask(
+        tokens: Int[Tensor, "num_dialogues seq"],
+        tokenizer_out: Any,
+        formatted_dialogues: list[str],
+        for_generation: bool,
+        detect_all: bool,
+        padding: dict[str, int],
+    ) -> Bool[Tensor, "num_dialogues seq"] | None:
+        """Detection mask for gpt-oss harmony output.
+
+        The dialogue is truncated so the probed turn is the final assistant turn, which
+        is the only turn harmony renders an analysis channel for. We mark that turn's
+        analysis span (reasoning) and final span (visible answer); reasoning-only probes
+        narrow to the analysis span downstream (narrow_mask_to_reasoning is harmony-aware).
+        """
+        if for_generation:
+            return None
+        if detect_all:
+            return torch.ones_like(tokens).bool()
+
+        detection_mask = torch.zeros_like(tokens).bool()
+        for batch_idx, text in enumerate(formatted_dialogues):
+            spans: list[tuple[int, int]] = []
+            analysis = list(TokenizedDataset._GPTOSS_ANALYSIS_RE.finditer(text))
+            final = list(TokenizedDataset._GPTOSS_FINAL_RE.finditer(text))
+            # target turn is last -> its analysis/final are the last matches
+            if analysis:
+                spans.append((analysis[-1].start(1), analysis[-1].end(1)))
+            if final:
+                spans.append((final[-1].start(1), final[-1].end(1)))
+            for start_char_idx, end_char_idx in spans:
+                start_tok_index = tokenizer_out.char_to_token(batch_idx, start_char_idx)
+                if start_tok_index is None:
+                    continue  # empty span (e.g. no reasoning on this turn)
+                end_tok_index = tokenizer_out.char_to_token(batch_idx, end_char_idx)
+                if end_tok_index is None:
+                    end_tok_index = tokens.shape[1]
+                detection_mask[
+                    batch_idx,
+                    start_tok_index - padding["left"] : end_tok_index + padding["right"],
+                ] = True
+
+        if detection_mask.sum() == 0:
+            logger.warning("No tokens in gpt-oss detection mask")
+        return detection_mask
+
     @classmethod
     def from_dialogue_list(
         cls,
@@ -305,13 +413,26 @@ class TokenizedDataset:
             tokenizer_type = "qwen"
         elif "GLM" in tokenizer.name_or_path or tokenizer.name_or_path.startswith("zai-org/"):
             tokenizer_type = "glm"
+        elif tokenizer.name_or_path.startswith("deepseek-ai/"):
+            # DeepSeek-R1-Distill (loaded with a custom non-stripping chat template,
+            # see get_llama3_model_and_tokenizer); uses <｜User｜>/<｜Assistant｜> tokens.
+            tokenizer_type = "r1"
+        elif "gpt-oss" in tokenizer.name_or_path or tokenizer.name_or_path.startswith("openai/"):
+            # openai/gpt-oss-* harmony format; reasoning lives in the analysis channel,
+            # handled via a bespoke detection mask (not the generic prefix loop).
+            tokenizer_type = "gptoss"
         else:
-            raise NotImplementedError("Only gemma, mistral, llama, qwen, and glm tokenizers are supported")
+            raise NotImplementedError(
+                "Only gemma, mistral, llama, qwen, glm, r1 (deepseek), and gptoss tokenizers "
+                "are supported"
+            )
 
-        # if llama and no system prompt, throw a warning
+        # llama/mistral: if no system prompt, add a default. For mistral this is required —
+        # otherwise its chat template injects its OWN default system prompt, which isn't in
+        # `dialogues` and desyncs the detection-mask char offsets.
         if (
             ensure_system_prompt
-            and tokenizer_type == "llama"
+            and tokenizer_type in ("llama", "mistral")
             and not any(d[0].role == "system" for d in dialogues)
         ):
             logger.warning(
@@ -360,10 +481,30 @@ class TokenizedDataset:
                 )
             dialogues = new_dialogues
 
-        # gemma and mistral don't have a system prompt, so we fold it into the user prompt
-        # qwen and glm support system prompts like llama
-        fold_system = tokenizer_type in ["gemma", "mistral"]
-        processed = [preprocess_dialogue(d, fold_system=fold_system) for d in dialogues]
+        # gpt-oss harmony renders the analysis (reasoning) channel only for the FINAL
+        # assistant turn, like Qwen. Truncate to the target turn so its reasoning is
+        # rendered. Harmony reads reasoning from a separate ``thinking`` field, built in
+        # _gptoss_harmony_dicts (splitting the inline <think> form); the detection mask is
+        # then computed bespoke from the channel spans (see _get_gptoss_detection_mask),
+        # because harmony's structure (auto system preamble, developer-folded system,
+        # two channel messages per assistant turn) does not fit the generic prefix loop.
+        if tokenizer_type == "gptoss":
+            new_dialogues = []
+            for d in dialogues:
+                detect_idx = [i for i, m in enumerate(d) if m.detect]
+                new_dialogues.append(d[: max(detect_idx) + 1] if detect_idx else d)
+            dialogues = new_dialogues
+
+        # gemma has no system role, so we fold any system prompt into the user prompt.
+        # mistral/llama/qwen/glm DO support system prompts (mistral renders them in a
+        # [SYSTEM_PROMPT] block). Folding mistral was a bug: with no system message the
+        # Mistral-Small template auto-injects its own default system prompt, desyncing the
+        # detection-mask char offsets (the ensure-system block below prevents that case).
+        fold_system = tokenizer_type == "gemma"
+        if tokenizer_type == "gptoss":
+            processed = [cls._gptoss_harmony_dicts(d) for d in dialogues]
+        else:
+            processed = [preprocess_dialogue(d, fold_system=fold_system) for d in dialogues]
         final_assistants = [cls._final_message_is_assistant(d) for d in dialogues]
         assert all(final_assistants[0] == fa for fa in final_assistants)
         final_assistant = final_assistants[0]
@@ -379,6 +520,8 @@ class TokenizedDataset:
                     "llama": "<|eot_id|>",
                     "qwen": "<|im_end|>\n",
                     "glm": "<|endoftext|>",
+                    "r1": "<｜end▁of▁sentence｜>",
+                    "gptoss": "<|return|>",
                 }[tokenizer_type]
                 formatted_dialogues = [d.removesuffix(eot_suffix) for d in formatted_dialogues]
         else:
@@ -395,17 +538,32 @@ class TokenizedDataset:
             truncation=True,
         )
 
+        # Capture per-token char offsets (fast tokenizers only) for robust span matching.
+        offsets: list[list[tuple[int, int]]] | None = None
+        if tokenizer_out.encodings is not None:
+            offsets = [list(e.offsets) for e in tokenizer_out.encodings]
+
         tokens: torch.Tensor = tokenizer_out["input_ids"]  # type: ignore
-        detection_mask = cls._get_detection_mask(
-            tokens,
-            tokenizer_out,
-            dialogues,
-            formatted_dialogues,
-            for_generation,
-            detect_all,
-            padding[tokenizer_type],
-            tokenizer_type,
-        )
+        if tokenizer_type == "gptoss":
+            detection_mask = cls._get_gptoss_detection_mask(
+                tokens,
+                tokenizer_out,
+                formatted_dialogues,
+                for_generation,
+                detect_all,
+                padding[tokenizer_type],
+            )
+        else:
+            detection_mask = cls._get_detection_mask(
+                tokens,
+                tokenizer_out,
+                dialogues,
+                formatted_dialogues,
+                for_generation,
+                detect_all,
+                padding[tokenizer_type],
+                tokenizer_type,
+            )
         if detection_mask is not None and detect_only_start_of_turn:
             sot_tok = cast(int, tokenizer("<start_of_turn>", add_special_tokens=False).input_ids[0])
             detection_mask = detection_mask & (tokens == sot_tok)
@@ -416,6 +574,8 @@ class TokenizedDataset:
                 "llama": "<|eot_id|>",
                 "qwen": "<|im_end|>\n",
                 "glm": "<|endoftext|>",
+                "r1": "<｜end▁of▁sentence｜>",
+                "gptoss": "<|end|>",
             }[tokenizer_type]
             eot_tok = cast(int, tokenizer(eot_tok_str, add_special_tokens=False).input_ids[0])
             # we only want to use the detection mask on the last token of the message
@@ -435,6 +595,7 @@ class TokenizedDataset:
             detection_mask=detection_mask,
             attention_mask=cast(Tensor, tokenizer_out["attention_mask"]),
             dataset_partial_id=dataset_partial_id,
+            offsets=offsets,
         )
 
     @classmethod

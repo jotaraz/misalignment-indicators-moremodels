@@ -1,7 +1,8 @@
+import os
 from enum import Enum
 from functools import cache
 from pathlib import Path
-from typing import Literal, cast, overload
+from typing import Any, Literal, cast, overload
 
 import torch
 from dotenv import load_dotenv
@@ -17,7 +18,10 @@ from deception_detection.log import logger
 
 # We only use the instruct variations of the models. Note not all sizes are available for all model
 # families.
-ModelType = Literal["gemma", "mistral", "llama", "qwen", "glm"]
+# "r1" is a tokenizer_type only (DeepSeek-R1-Distill); the ModelName.type for R1 is
+# still "llama" since it loads via the Llama-3 path. "gptoss" is both a ModelName.type
+# (own loader) and a tokenizer_type (harmony channel format).
+ModelType = Literal["gemma", "mistral", "llama", "qwen", "glm", "r1", "gptoss"]
 ModelSize = Literal[1, 2, 3, 7, 8, 9, 14, 24, 27, 32, 70]
 
 
@@ -38,6 +42,7 @@ class ModelName(str, Enum):
     QWEN_32B = "qwen-32b"
     QWEN_35B = "qwen-35b"  # Qwen3.6-35B-A3B (MoE, hybrid linear/full attention)
     GLM_FLASH = "glm-9b-flash"
+    GPTOSS_120B = "gptoss-120b"  # openai/gpt-oss-120b (MoE, 36 layers, harmony reasoning)
 
     @property
     def type(self) -> ModelType:
@@ -68,6 +73,8 @@ def get_num_layers_for_model(model_name: ModelName) -> int:
         n_layers = {14: 40, 32: 64, 35: 40}  # 35 = Qwen3.6-35B-A3B (40 layers)
     elif model_name.type == "glm":
         n_layers = {9: 47}
+    elif model_name.type == "gptoss":
+        n_layers = {120: 36}  # gpt-oss-120b
     else:
         raise NotImplementedError(f"No number of layers for model {model_name}")
     return n_layers[model_name.size]
@@ -127,11 +134,21 @@ def get_model_and_tokenizer(
         model, tokenizer = get_qwen_model_and_tokenizer(model_name, omit_model)
     elif model_name.type == "glm":
         model, tokenizer = get_glm_model_and_tokenizer(model_name, omit_model)
+    elif model_name.type == "gptoss":
+        model, tokenizer = get_gpt_oss_model_and_tokenizer(model_name, omit_model)
     else:
         raise ValueError(f"Invalid model type: {model_name.type}")
 
     if cut_at_layer is not None and model is not None:
         model.model.layers = model.model.layers[:cut_at_layer]
+        # Reclaim the dropped upper layers' GPU memory so multi-GPU extraction
+        # (device_map="auto") with output_hidden_states has headroom for accelerate's
+        # cross-device gather of the hidden-state tuple (otherwise 70B+ models OOM).
+        import gc
+
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     return model, tokenizer
 
@@ -274,6 +291,22 @@ def get_llama3_model_and_tokenizer(
         tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="left")
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
+        # DeepSeek-R1's stock template strips <think> reasoning from every assistant
+        # turn (`content.split('</think>')[-1]`), which would delete the spans the
+        # reasoning probe must read. Remove that one statement so the target turn's
+        # reasoning renders verbatim in its native <think>...</think> tokens. The
+        # detection mask then aligns without any normalization (see _prefix_pattern
+        # "r1" in tokenized_data.py). Assert the statement is present so we fail loudly
+        # if the upstream template changes shape.
+        _r1_strip = (
+            "{% if '</think>' in content %}"
+            "{% set content = content.split('</think>')[-1] %}{% endif %}"
+        )
+        assert _r1_strip in tokenizer.chat_template, (
+            "DeepSeek-R1 chat template changed upstream; the reasoning-strip patch "
+            "no longer applies. Re-derive the strip statement before training."
+        )
+        tokenizer.chat_template = tokenizer.chat_template.replace(_r1_strip, "")
     else:
         tokenizer = get_llama3_tokenizer()
 
@@ -312,14 +345,77 @@ def get_qwen_model_and_tokenizer(
         return None, tokenizer
 
     models_directory = Path("/data/huggingface")
+    # Default eager (matches probe training). For scoring LONG agentic rollouts,
+    # eager materializes the full seq×seq attention matrix and OOMs (single 17-35GB
+    # allocs on the longest Qwen-35B dialogues); set ATTN_IMPL=sdpa to use the
+    # memory-efficient kernel (numerically-equivalent hidden states, O(seq) memory).
+    attn_impl = os.environ.get("ATTN_IMPL", "eager")
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=torch.bfloat16,
         device_map="auto",
-        attn_implementation="eager",
+        attn_implementation=attn_impl,
         # cache_dir=models_directory,
         # local_files_only=True,
     )
+
+    logger.info(f"Loaded model {model_name}")
+
+    if model.device == torch.device("cpu"):
+        logger.warning("Model is on CPU")
+
+    model.eval()
+    return model, tokenizer
+
+
+@cache
+def get_gpt_oss_model_and_tokenizer(
+    model_name: ModelName, omit_model: bool = False
+) -> tuple[PreTrainedModel | None, PreTrainedTokenizerBase]:
+    """Return openai/gpt-oss-120b model and tokenizer.
+
+    gpt-oss ships MXFP4-quantized weights. We load them NATIVELY (no dequantization):
+    dequantizing to bf16 balloons the model to ~240GB which fills 4xH100 and leaves no
+    headroom for eager attention's [heads, seq, seq] matrices, OOMing on longer
+    sequences. Native MXFP4 is ~63GB (fits one 80GB H100), leaving ample room. The MXFP4
+    expert kernels need Triton + nvcc, so the cluster run_train.sh must `module load
+    cuda/12.9` first (see mpi-cluster guide); colosseum-detection runs this model in
+    MXFP4 here. Hidden states (what the probe reads) are bf16 regardless of weight
+    quantization, so activation extraction is unaffected.
+    """
+    if not model_name.type == "gptoss":
+        raise ValueError(f"Expected gpt-oss model, got {model_name}")
+
+    model_path = {
+        ModelName.GPTOSS_120B: "openai/gpt-oss-120b",
+    }[model_name]
+
+    load_dotenv()  # for hf token
+    tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="left")
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    if omit_model:
+        return None, tokenizer
+
+    # gpt-oss only supports eager attention here (sdpa is rejected by _sdpa_can_dispatch).
+    # eager materializes [heads, seq, seq], so give it headroom via enough GPUs: bf16
+    # gpt-oss-120b (~240GB) over 6xH100 (~40GB free/GPU) fits eager attention; 4 GPUs
+    # left a GPU ~full and OOMed on long sequences. Native MXFP4 (~63GB) would be lighter
+    # but needs the MXFP4 kernels wired up in this env (dispatch OOMed without them).
+    from_pretrained_kwargs: dict[str, Any] = dict(
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        attn_implementation="eager",
+    )
+    try:
+        from transformers import Mxfp4Config  # type: ignore
+
+        from_pretrained_kwargs["quantization_config"] = Mxfp4Config(dequantize=True)
+    except ImportError:
+        logger.warning("Mxfp4Config unavailable; loading gpt-oss with torch_dtype=bf16 only")
+
+    model = AutoModelForCausalLM.from_pretrained(model_path, **from_pretrained_kwargs)
 
     logger.info(f"Loaded model {model_name}")
 

@@ -70,6 +70,11 @@ class DialogueDataset:
         "llama": {"left": 4, "right": 1},
         "qwen": {"left": 4, "right": 1},
         "glm": {"left": 4, "right": 1},
+        # R1's <｜Assistant｜> header is a single token and reasoning probes score the
+        # content (incl. <think>) directly, so no boilerplate padding is included.
+        "r1": {"left": 0, "right": 0},
+        # gpt-oss masks channel-message spans directly (no header boilerplate).
+        "gptoss": {"left": 0, "right": 0},
     }
 
     # -- Instance attribute types--

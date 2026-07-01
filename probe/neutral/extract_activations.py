@@ -1,19 +1,24 @@
 """
-Generate on-policy completions from GLM-4.7 Flash and extract activations for PCA denoising.
+Generate on-policy completions and extract neutral activations for PCA denoising.
 
-Phase 1: Generate responses using vLLM (continuous batching, ~10-20x faster than HF generate).
-Phase 2: Batched forward passes with HF model to extract per-layer hidden state activations.
-         Dialogues are sorted by length and grouped into batches for efficient padding.
+Phase 1: Generate responses. Two backends:
+   - vllm: continuous batching, fast — but needs a vLLM build that supports the
+     target arch (GLM-4.7-Flash = glm4_moe_lite, Qwen3.6-35B-A3B hybrid attn are
+     brand-new; vLLM may not support them, and its transformers pin conflicts with
+     the transformers>=5.9 these archs require).
+   - hf:   model.generate on the SAME HF model used for extraction. Slower, but one
+     env / one load and works on any arch transformers 5.9 can load. Default.
+Phase 2: Batched HF forward passes to extract per-layer hidden-state activations.
+         Dialogues are sorted/shuffled and grouped into batches.
 
-Activations are saved as float16 tensors per layer in probe/data/neutral/activations/.
+Outputs go to probe/data/neutral/<model>/ : dialogues.json + activations/layer{L}.pt.
+Prompts (probe/data/neutral/prompts.json) are model-agnostic and shared.
 
 Usage:
-    python -m probe.neutral.extract_activations
-    python -m probe.neutral.extract_activations --max-prompts 1000
-    python -m probe.neutral.extract_activations --dialogues-path probe/data/neutral/dialogues.json  # skip generation
-    python -m probe.neutral.extract_activations --tp 2  # tensor parallel across 2 GPUs for generation
-
-Requires: pip install vllm
+    python -m probe.neutral.extract_activations --model glm
+    python -m probe.neutral.extract_activations --model qwen --gen-backend hf
+    python -m probe.neutral.extract_activations --model glm --gen-backend vllm --tp 2
+    python -m probe.neutral.extract_activations --model qwen --dialogues-path .../dialogues.json  # skip gen
 """
 
 import argparse
@@ -44,9 +49,16 @@ from deception_detection.models import ModelName, get_model_and_tokenizer
 from deception_detection.tokenized_data import TokenizedDataset
 from deception_detection.types import Dialogue, Message
 
-MODEL_NAME = ModelName.GLM_FLASH
-MODEL_PATH = "zai-org/GLM-4.7-Flash"
-DEFAULT_LAYERS = [27, 28, 29, 30]
+# Model registry — the only model-specific knobs. `--model glm|qwen` picks one.
+# layers cover each model's probe layers (GLM 27/29, Qwen 23/25) plus neighbours.
+MODEL_CONFIGS = {
+    "glm":  {"name": ModelName.GLM_FLASH, "path": "zai-org/GLM-4.7-Flash", "layers": [27, 28, 29, 30]},
+    "qwen": {"name": ModelName.QWEN_35B,  "path": "Qwen/Qwen3.6-35B-A3B",  "layers": [23, 24, 25, 26]},
+}
+# Selected from --model in main(); vllm_generate() reads MODEL_PATH, extraction reads MODEL_NAME.
+MODEL_NAME = MODEL_CONFIGS["glm"]["name"]
+MODEL_PATH = MODEL_CONFIGS["glm"]["path"]
+DEFAULT_LAYERS = MODEL_CONFIGS["glm"]["layers"]
 DEFAULT_PADDING = {
     "gemma": {"left": 0, "right": 0},
     "mistral": {"left": 0, "right": 0},
@@ -58,8 +70,15 @@ DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant."
 
 
 # ---------------------------------------------------------------------------
-# Phase 1: Generation via vLLM
+# Phase 1: Generation
 # ---------------------------------------------------------------------------
+
+
+def _maybe_readd_think(text: str) -> str:
+    # vLLM/templates strip the opening <think> for thinking models but keep </think>.
+    if "</think>" in text and "<think>" not in text:
+        return "<think>" + text
+    return text
 
 
 def vllm_generate(
@@ -68,16 +87,10 @@ def vllm_generate(
     max_new_tokens: int = 256,
     tensor_parallel_size: int = 1,
 ) -> list[str]:
-    """
-    Generate responses for all prompts using vLLM.
-
-    vLLM uses continuous batching and PagedAttention, so it processes
-    all prompts efficiently without manual batching. ~10-20x faster
-    than HuggingFace model.generate().
-    """
+    """Generate responses for all prompts using vLLM (continuous batching)."""
     from vllm import LLM, SamplingParams
 
-    print(f"  Loading vLLM model (tp={tensor_parallel_size})...")
+    print(f"  Loading vLLM model {MODEL_PATH} (tp={tensor_parallel_size})...")
     llm = LLM(
         model=MODEL_PATH,
         tensor_parallel_size=tensor_parallel_size,
@@ -87,8 +100,6 @@ def vllm_generate(
     )
 
     tokenizer = llm.get_tokenizer()
-
-    # Format prompts with chat template
     formatted_prompts = []
     for prompt in prompts:
         messages = [
@@ -100,28 +111,57 @@ def vllm_generate(
         )
         formatted_prompts.append(text)
 
-    sampling_params = SamplingParams(
-        max_tokens=max_new_tokens,
-        temperature=0.7,
-        top_p=0.9,
-    )
-
+    sampling_params = SamplingParams(max_tokens=max_new_tokens, temperature=0.7, top_p=0.9)
     print(f"  Generating {len(formatted_prompts)} responses...")
     outputs = llm.generate(formatted_prompts, sampling_params)
 
-    responses = []
-    for output in outputs:
-        text = output.outputs[0].text.strip()
-        # vLLM strips the opening <think> tag for thinking models but keeps </think>.
-        # Re-add <think> so the GLM chat template and detection mask alignment work.
-        if "</think>" in text and "<think>" not in text:
-            text = "<think>" + text
-        responses.append(text)
+    responses = [_maybe_readd_think(o.outputs[0].text.strip()) for o in outputs]
 
-    # Free vLLM GPU memory before loading HF model
     del llm
     torch.cuda.empty_cache()
+    return responses
 
+
+def hf_generate(
+    prompts: list[str],
+    system_prompt: str,
+    model: Any,
+    tokenizer: Any,
+    max_new_tokens: int = 256,
+    batch_size: int = 16,
+) -> list[str]:
+    """On-policy completions via HF model.generate — reuses the SAME model we load
+    for extraction (one env, one load). Slower than vLLM but works on any arch
+    transformers 5.9 can load (glm4_moe_lite, Qwen3.6 hybrid)."""
+    prev_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    responses: list[str] = []
+    for s in trange(0, len(prompts), batch_size, desc=f"HF generate (bs={batch_size})"):
+        batch = prompts[s : s + batch_size]
+        texts = [
+            tokenizer.apply_chat_template(
+                [{"role": "system", "content": system_prompt}, {"role": "user", "content": p}],
+                tokenize=False, add_generation_prompt=True,
+            )
+            for p in batch
+        ]
+        enc = tokenizer(texts, return_tensors="pt", padding=True, truncation=True,
+                        max_length=1024).to(model.device)
+        with torch.no_grad():
+            out = model.generate(
+                **enc, max_new_tokens=max_new_tokens, do_sample=True,
+                temperature=0.7, top_p=0.9, pad_token_id=tokenizer.pad_token_id,
+            )
+        gen = out[:, enc["input_ids"].shape[1]:]
+        for g in gen:
+            responses.append(_maybe_readd_think(tokenizer.decode(g, skip_special_tokens=True).strip()))
+        del enc, out, gen
+        torch.cuda.empty_cache()
+
+    tokenizer.padding_side = prev_side
     return responses
 
 
@@ -269,12 +309,17 @@ def extract_neutral_activations(
 
 
 def main():
+    global MODEL_NAME, MODEL_PATH, DEFAULT_LAYERS
     parser = argparse.ArgumentParser(
         description="Generate on-policy completions and extract neutral activations"
     )
+    parser.add_argument("--model", choices=list(MODEL_CONFIGS), default="glm",
+                        help="target model (sets HF path, ModelName, default layers, output subdir)")
+    parser.add_argument("--gen-backend", choices=["hf", "vllm"], default="hf",
+                        help="generation engine (default hf — vLLM may not support these MoE archs)")
     parser.add_argument(
         "--prompts-path", type=str, default=None,
-        help="Path to prompts JSON (default: probe/data/neutral/prompts.json)",
+        help="Path to prompts JSON (default: probe/data/neutral/prompts.json, shared)",
     )
     parser.add_argument(
         "--dialogues-path", type=str, default=None,
@@ -282,18 +327,14 @@ def main():
     )
     parser.add_argument(
         "--output-dir", type=str, default=None,
-        help="Output directory for activations (default: probe/data/neutral/activations/)",
+        help="Output dir for activations (default: probe/data/neutral/<model>/activations/)",
     )
-    parser.add_argument("--layers", type=int, nargs="+", default=DEFAULT_LAYERS)
+    parser.add_argument("--layers", type=int, nargs="+", default=None,
+                        help="layers to extract (default: per-model from registry)")
     parser.add_argument("--max-new-tokens", type=int, default=256)
-    parser.add_argument(
-        "--tp", type=int, default=1,
-        help="Tensor parallel size for vLLM generation (default: 1)",
-    )
-    parser.add_argument(
-        "--extract-batch-size", type=int, default=32,
-        help="Batch size for activation extraction phase (default: 32)",
-    )
+    parser.add_argument("--tp", type=int, default=1, help="Tensor parallel size for vLLM generation")
+    parser.add_argument("--gen-batch-size", type=int, default=16, help="Batch size for HF generation")
+    parser.add_argument("--extract-batch-size", type=int, default=32, help="Batch size for extraction")
     parser.add_argument("--max-prompts", type=int, default=None, help="Limit number of prompts")
     parser.add_argument(
         "--max-tokens-per-layer", type=int, default=100_000,
@@ -302,14 +343,26 @@ def main():
     parser.add_argument("--system-prompt", type=str, default=DEFAULT_SYSTEM_PROMPT)
     args = parser.parse_args()
 
-    base_dir = Path(__file__).parent.parent / "data" / "neutral"
-    prompts_path = Path(args.prompts_path) if args.prompts_path else base_dir / "prompts.json"
+    # Select model
+    cfg = MODEL_CONFIGS[args.model]
+    MODEL_NAME = cfg["name"]
+    MODEL_PATH = cfg["path"]
+    if args.layers is None:
+        args.layers = cfg["layers"]
+    print(f"Model: {args.model} -> {MODEL_PATH} ({MODEL_NAME.value}) | layers {args.layers} | gen={args.gen_backend}")
+
+    shared_dir = Path(__file__).parent.parent / "data" / "neutral"          # prompts.json (shared)
+    base_dir = shared_dir / args.model                                       # per-model dialogues/activations
+    base_dir.mkdir(parents=True, exist_ok=True)
+    prompts_path = Path(args.prompts_path) if args.prompts_path else shared_dir / "prompts.json"
     output_dir = Path(args.output_dir) if args.output_dir else base_dir / "activations"
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    # Phase 1: Generate or load dialogues
     dialogues_path = base_dir / "dialogues.json"
 
+    # The HF model is needed for extraction always, and for generation when gen-backend=hf.
+    model = tokenizer = None
+
+    # Phase 1: Generate or load dialogues
     if args.dialogues_path:
         print(f"Loading pre-generated dialogues from {args.dialogues_path}")
         with open(args.dialogues_path) as f:
@@ -322,12 +375,19 @@ def main():
             prompts = prompts[: args.max_prompts]
         print(f"Loaded {len(prompts)} prompts")
 
-        print(f"\nPhase 1: Generating responses via vLLM (tp={args.tp})...")
-        responses = vllm_generate(
-            prompts, args.system_prompt,
-            max_new_tokens=args.max_new_tokens,
-            tensor_parallel_size=args.tp,
-        )
+        print(f"\nPhase 1: Generating responses (backend={args.gen_backend})...")
+        if args.gen_backend == "vllm":
+            responses = vllm_generate(
+                prompts, args.system_prompt,
+                max_new_tokens=args.max_new_tokens, tensor_parallel_size=args.tp,
+            )
+        else:
+            print("  Loading HF model for generation + extraction...")
+            model, tokenizer = get_model_and_tokenizer(MODEL_NAME)
+            responses = hf_generate(
+                prompts, args.system_prompt, model, tokenizer,
+                max_new_tokens=args.max_new_tokens, batch_size=args.gen_batch_size,
+            )
 
         dialogues = []
         for prompt, response in zip(prompts, responses):
@@ -338,7 +398,6 @@ def main():
                     "assistant_response": response,
                 })
 
-        # Save dialogues for reuse
         with open(dialogues_path, "w") as f:
             json.dump(dialogues, f, indent=2)
         print(f"Saved {len(dialogues)} dialogues to {dialogues_path}")
@@ -347,8 +406,9 @@ def main():
         dialogues = dialogues[: args.max_prompts]
 
     # Phase 2: Extract activations with HF model (need output_hidden_states)
-    print(f"\nPhase 2: Loading HF model for activation extraction...")
-    model, tokenizer = get_model_and_tokenizer(MODEL_NAME)
+    if model is None:
+        print(f"\nPhase 2: Loading HF model for activation extraction...")
+        model, tokenizer = get_model_and_tokenizer(MODEL_NAME)
 
     print(f"Extracting activations from {len(dialogues)} dialogues...")
     print(f"  Layers: {args.layers}")
@@ -361,18 +421,19 @@ def main():
         batch_size=args.extract_batch_size,
     )
 
-    # Free GPU memory
     del model
     torch.cuda.empty_cache()
 
-    # Save
     for layer, acts in layer_acts.items():
         save_path = output_dir / f"layer{layer}.pt"
         torch.save(acts, save_path)
         print(f"Saved layer {layer}: {acts.shape} to {save_path}")
 
     meta = {
+        "model": args.model,
         "model_name": MODEL_NAME.value,
+        "model_path": MODEL_PATH,
+        "gen_backend": args.gen_backend,
         "layers": args.layers,
         "n_dialogues": len(dialogues),
         "tokens_per_layer": {str(l): t.shape[0] for l, t in layer_acts.items()},

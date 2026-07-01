@@ -1236,9 +1236,18 @@ def run_batch_evaluation(config: BatchEvalConfig) -> list[dict[str, Any]]:
     model_name = ExperimentConfig.from_path(Path(config.experiment_folders[0])).model_name
     print(f"  {len(detectors)} detectors, layers: {all_layers_sorted}")
 
-    # 2. Load model once
-    print(f"Loading model: {model_name}")
-    model, tokenizer = get_model_and_tokenizer(ModelName(model_name))
+    # 2. Load model once. We only read hidden states up to the top detection
+    # layer, so truncate the transformer stack there (cut_at_layer). This frees
+    # the unused upper layers and — crucially for big models (GLM-4.7-Flash ~64GB,
+    # Qwen-35B ~70GB) — leaves headroom so the final lm_head forward over a LONG
+    # dialogue doesn't OOM (its logits are discarded by probe scoring anyway).
+    # Set CUT_AT_LAYER=0 to disable.
+    import os as _os
+    cut_at_layer = (max(all_layers_sorted) + 1) if all_layers_sorted else None
+    if _os.environ.get("CUT_AT_LAYER") == "0":
+        cut_at_layer = None
+    print(f"Loading model: {model_name} (cut_at_layer={cut_at_layer})")
+    model, tokenizer = get_model_and_tokenizer(ModelName(model_name), cut_at_layer=cut_at_layer)
 
     tok_name = getattr(tokenizer, "name_or_path", "")
     template_kwargs: dict = {}

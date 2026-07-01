@@ -32,5 +32,6 @@ submit llama-70b-r1     "48 50" 2   # DeepSeek-R1-Distill-Llama-70B (reasoning)
 submit llama-70b-3.3    "48 50" 2   # Llama-3.3-70B-Instruct (vanilla)
 submit gemma-27b        "27 29" 1   # gemma-2-27b-it (vanilla)
 submit mistral-24b      "23 25" 1   # Mistral-Small-24B-Instruct-2501 (vanilla)
+submit gptoss-120b      "20 22" 4   # openai/gpt-oss-120b (reasoning, harmony; bf16 ~240GB)
 
 echo "All training jobs submitted. Monitor: condor_q jtaraz"

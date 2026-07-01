@@ -37,6 +37,12 @@ MODELS = {
         probe_model="mistral-24b", probe_dir="probes_mistral_24b", layers=[23, 25],
         bloom_key="mistral-small-24b", dir_slug="mistral_small_24b", reasoning=False,
     ),
+    "gptoss-120b": dict(
+        # gpt-oss-120b has 36 layers; 20/22 depth-matches GLM 27/29 of 47 (~0.58-0.62).
+        # Reasoning lives in the harmony analysis channel (handled via bespoke mask).
+        probe_model="gptoss-120b", probe_dir="probes_gpt_oss_120b", layers=[20, 22],
+        bloom_key="gpt-oss-120b", dir_slug="gpt_oss_120b", reasoning=True,
+    ),
 }
 
 

@@ -78,6 +78,8 @@ DEFAULT_PADDING = {
     "llama": {"left": 0, "right": 0},
     "qwen": {"left": 0, "right": 0},
     "glm": {"left": 0, "right": 0},
+    "r1": {"left": 0, "right": 0},  # DeepSeek-R1-Distill (reasoning)
+    "gptoss": {"left": 0, "right": 0},  # gpt-oss-120b (harmony channels)
 }
 
 
@@ -193,6 +195,13 @@ def narrow_mask_to_reasoning(
     if toks.detection_mask is None:
         return
 
+    # gpt-oss harmony puts reasoning in its analysis channel rather than <think> tags.
+    name_or_path = getattr(tokenizer, "name_or_path", "")
+    if "gpt-oss" in name_or_path or name_or_path.startswith("openai/"):
+        open_tag, close_tag = "<|channel|>analysis<|message|>", "<|end|>"
+    else:
+        open_tag, close_tag = "<think>", "</think>"
+
     for batch_idx in range(toks.tokens.shape[0]):
         mask = toks.detection_mask[batch_idx]
         tokens = toks.tokens[batch_idx]
@@ -202,22 +211,22 @@ def narrow_mask_to_reasoning(
         attended_pos = attn_mask.nonzero(as_tuple=True)[0]
         str_tokens = [tokenizer.decode([tokens[p].item()]) for p in attended_pos]
 
-        # Reconstruct full text and find <think>...</think> content char ranges
+        # Reconstruct full text and find reasoning content char ranges
         full_text = "".join(str_tokens)
         reasoning_char_ranges: list[tuple[int, int]] = []
         search_start = 0
         while True:
-            start = full_text.find("<think>", search_start)
+            start = full_text.find(open_tag, search_start)
             if start == -1:
                 break
-            content_start = start + len("<think>")
-            end = full_text.find("</think>", content_start)
+            content_start = start + len(open_tag)
+            end = full_text.find(close_tag, content_start)
             if end == -1:
-                # Unclosed <think>: treat rest as reasoning
+                # Unclosed reasoning block: treat rest as reasoning
                 reasoning_char_ranges.append((content_start, len(full_text)))
                 break
             reasoning_char_ranges.append((content_start, end))
-            search_start = end + len("</think>")
+            search_start = end + len(close_tag)
 
         # Map token positions to reasoning ranges and narrow the mask
         char_offset = 0
@@ -252,31 +261,55 @@ def narrow_mask_to_spans(
     if len(detected_indices) == 0 or not spans:
         return
 
-    # Reconstruct text from detected tokens
-    detected_str_tokens = [toks.str_tokens[0][j] for j in detected_indices]
-    detected_text = "".join(detected_str_tokens)
-
-    # Build new mask: only tokens overlapping with any span
     new_mask = torch.zeros_like(mask)
 
+    # Preferred: map spans via the fast tokenizer's char offsets into the (correctly
+    # spaced) formatted dialogue. This is robust to tokenizers whose per-token decode
+    # does not round-trip (e.g. DeepSeek-R1 drops spaces, so the str_tokens fallback
+    # below never matches and would zero the mask).
+    if getattr(toks, "offsets", None) is not None and toks.formatted_dialogues:
+        text = toks.formatted_dialogues[0]
+        offsets = toks.offsets[0]
+        det = detected_indices.tolist()
+        det_offsets = [offsets[j] for j in det if offsets[j][1] > offsets[j][0]]
+        if not det_offsets:
+            return
+        region_start = min(a for a, _ in det_offsets)
+        region_end = max(b for _, b in det_offsets)
+        for span_text in spans:
+            if not span_text:
+                continue
+            search_start = region_start
+            while True:
+                idx = text.find(span_text, search_start)
+                if idx == -1 or idx >= region_end:
+                    break
+                end = idx + len(span_text)
+                for j in det:
+                    a, b = offsets[j]
+                    if b > a and a < end and b > idx:
+                        new_mask[j] = True
+                search_start = end
+        toks.detection_mask[0] = new_mask
+        return
+
+    # Fallback (slow tokenizers / no offsets): reconstruct text from per-token decode.
+    detected_str_tokens = [toks.str_tokens[0][j] for j in detected_indices]
+    detected_text = "".join(detected_str_tokens)
     for span_text in spans:
-        # Find span in the reconstructed detected-region text
         search_start = 0
         while True:
             idx = detected_text.find(span_text, search_start)
             if idx == -1:
                 break
             end = idx + len(span_text)
-
-            # Map character range → token indices
             char_pos = 0
             for k, tok_str in enumerate(detected_str_tokens):
                 tok_end = char_pos + len(tok_str)
                 if char_pos < end and tok_end > idx:
                     new_mask[detected_indices[k]] = True
                 char_pos = tok_end
-
-            search_start = end  # advance past this match
+            search_start = end
 
     toks.detection_mask[0] = new_mask
 
@@ -762,6 +795,9 @@ def extract_activations(
                 print(f"  Skipping sample {i}: {type(e).__name__}: {str(e)[:120]}")
             continue
 
+        _diag = i < 8  # TEMP diagnostic for first few samples
+        _base_sum = int(toks.detection_mask.sum()) if toks.detection_mask is not None else -1
+
         # Narrow detection mask to reasoning tokens.
         # - reasoning_only: narrow all samples
         # - reasoning_positive_only: narrow only positive samples (negatives
@@ -773,6 +809,14 @@ def extract_activations(
         if label_mode == "span" and sample.is_positive and sample.spans:
             narrow_mask_to_spans(toks, sample.spans)
 
+        _post_sum = int(toks.detection_mask.sum()) if toks.detection_mask is not None else -1
+        if _diag:
+            print(
+                f"  [diag] sample {i} is_pos={sample.is_positive} seq={tuple(toks.tokens.shape)} "
+                f"base_mask={_base_sum} post_narrow={_post_sum}",
+                flush=True,
+            )
+
         # Skip if detection mask is empty after narrowing
         if toks.detection_mask is not None and not toks.detection_mask.any():
             continue
@@ -781,6 +825,13 @@ def extract_activations(
             model, toks, batch_size=1, layers=detect_layers
         )
         masked = acts.get_masked_activations()  # [n_detected_tokens, n_layers, n_features]
+
+        if _diag:
+            print(
+                f"  [diag] sample {i} all_acts={tuple(acts.all_acts.shape)} "
+                f"masked={tuple(masked.shape)} numel={masked.numel()}",
+                flush=True,
+            )
 
         if masked.numel() == 0:
             del acts
@@ -796,6 +847,11 @@ def extract_activations(
     if n_skipped:
         print(f"  Skipped {n_skipped} samples due to tokenization errors")
 
+    print(
+        f"  [diag] collected pos={len(pos_acts_list)} neg={len(neg_acts_list)} "
+        f"n_skipped={n_skipped} total_samples={len(samples)}",
+        flush=True,
+    )
     if not pos_acts_list or not neg_acts_list:
         raise ValueError("No positive or negative activations extracted. Check your data.")
 
@@ -857,8 +913,34 @@ def train_detector(
         scaler_mean = scaler_mean.reshape(n_layers, n_features)
         scaler_scale = scaler_scale.reshape(n_layers, n_features)
 
-    X = X.to(device)
-    y = y.to(device)
+    # Move the activation matrix to GPU for a fast full-batch LR fit when it fits. For
+    # big models (device_map="auto" fills the GPUs with weights) this tens-of-GB matrix
+    # won't fit, so fit on CPU instead. The LR math is identical; only speed differs and
+    # small-model runs keep the GPU path. We decide proactively from free GPU memory
+    # (a 40GB alloc can hard-abort rather than raise) with an OOM catch as a backstop.
+    fit_device = device
+    if isinstance(device, str) and device.startswith("cuda") and torch.cuda.is_available():
+        try:
+            free_bytes, _ = torch.cuda.mem_get_info()
+        except Exception:
+            free_bytes = 0
+        if X.numel() * 4 > 0.8 * free_bytes:
+            fit_device = "cpu"
+            print(
+                f"  LR matrix ~{X.numel() * 4 / 1e9:.1f}GB exceeds free GPU mem "
+                f"(~{free_bytes / 1e9:.1f}GB); fitting on CPU",
+                flush=True,
+            )
+    try:
+        X = X.to(fit_device)
+        y = y.to(fit_device)
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        fit_device = "cpu"
+        X = X.to("cpu")
+        y = y.to("cpu")
+        print("  LR fit OOM; fell back to CPU", flush=True)
+    device = fit_device
 
     # Train logistic regression (no bias, matching sklearn fit_intercept=False)
     linear = nn.Linear(n_layers * n_features, 1, bias=False).to(device)
@@ -1598,9 +1680,15 @@ def main():
         print("All probes already trained. Nothing to do.")
         sys.exit(0)
 
-    # Load model once, reuse across all indicators
+    # Load model once, reuse across all indicators. Only layers up to the deepest
+    # detect layer are needed; truncating there frees the upper layers' weights and
+    # shrinks the output_hidden_states tuple, which is what OOMs multi-GPU
+    # (device_map="auto") extraction on 70B+ models. Extracted activations are
+    # identical (cutting upper layers doesn't change lower-layer outputs).
     print(f"Loading {MODEL_NAME.value} model and tokenizer...")
-    model, tokenizer = get_model_and_tokenizer(MODEL_NAME)
+    model, tokenizer = get_model_and_tokenizer(
+        MODEL_NAME, cut_at_layer=max(detect_layers) + 1
+    )
 
     # Warmup pass: GLM does lazy weight conversion on first forward
     print("Running warmup pass...")
